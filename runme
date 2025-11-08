@@ -1,0 +1,169 @@
+import random
+import pandas as pd # Assuming pandas is used for DataFrame creation and needs to be imported
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+import sqlite3
+
+# --- Configuration ---
+AMINO_ACIDS = 'ACDEFGHIKLMNPQRSTVWY' # 20 standard amino acids
+# Simulate a common pattern, e.g., a simple Nuclear Localization Signal (NLS) motif
+TARGET_MOTIF = 'RKKR'
+NUM_SEQUENCES = 500
+MAX_LENGTH = 150
+
+# --- Simulation Function ---
+def simulate_protein(is_patterned):
+    # Determine the length
+    length = random.randint(100, MAX_LENGTH)
+
+    # 1. Generate a random sequence
+    sequence = ''.join(random.choice(AMINO_ACIDS) for _ in range(length))
+
+    target_label = "Other"
+
+    # 2. Inject the pattern and update the label
+    if is_patterned:
+        # Choose a random position to insert the motif (excluding the very ends)
+        insert_pos = random.randint(10, length - len(TARGET_MOTIF) - 10)
+        sequence = sequence[:insert_pos] + TARGET_MOTIF + sequence[insert_pos + len(TARGET_MOTIF):]
+        target_label = "Motif_Present"
+
+    return sequence[:MAX_LENGTH], target_label # Ensure it's capped at max length
+
+
+# --- Generate the Dataset ---
+data = []
+# Create a balanced dataset (half with pattern, half without)
+for i in range(NUM_SEQUENCES):
+    is_patterned = i < (NUM_SEQUENCES / 2) # First half True, second half False
+    sequence, label = simulate_protein(is_patterned)
+
+    # Create a unique ID similar to a UniProt/RefSeq ID
+    protein_id = f"PLANA_{i+1:04d}"
+    data.append([protein_id, sequence, len(sequence), label])
+
+simulated_df = pd.DataFrame(data, columns=['ProteinID', 'Sequence', 'Length', 'TargetLabel'])
+
+print(f"Generated {len(simulated_df)} sequences.")
+print("\nSample Data:")
+
+DATABASE_FILE = 'planarian_proteome.db'
+
+# 1. Connect to the SQLite database file (creates it if it doesn't exist)
+conn = sqlite3.connect(DATABASE_FILE)
+cursor = conn.cursor()
+
+# 2. Define the schema (Planarian Sequences table)
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS Planarian_Proteome (
+    ProteinID TEXT PRIMARY KEY,
+    Sequence TEXT NOT NULL,
+    Length INTEGER,
+    TargetLabel TEXT
+);
+''')
+conn.commit()
+
+# 3. Populate the database from the Pandas DataFrame
+# 'if_exists='replace'' ensures a clean run every time
+simulated_df.to_sql('Planarian_Proteome', conn, if_exists='replace', index=False)
+
+# 4. Verify the database content
+print(f"\nDatabase '{DATABASE_FILE}' created and populated.")
+
+verification_count = pd.read_sql_query("SELECT COUNT(*) FROM Planarian_Proteome", conn).iloc[0, 0]
+print(f"Database row count: {verification_count}")
+
+# 5. Close the connection
+conn.close()
+print(simulated_df.head())
+
+DATABASE_FILE = 'planarian_proteome.db'
+
+# 1. Retrieve the data from the database
+conn = sqlite3.connect(DATABASE_FILE)
+ml_data = pd.read_sql_query("SELECT Sequence, TargetLabel FROM Planarian_Proteome", conn)
+conn.close()
+
+# 2. Encode the Target Labels (Y)
+label_encoder = LabelEncoder()
+Y = label_encoder.fit_transform(ml_data['TargetLabel'])
+print(f"\nTarget labels encoded: {label_encoder.classes_}")
+
+# 3. Feature Engineering: One-Hot Encoding and Padding (X)
+AA_CODES = 'ACDEFGHIKLMNPQRSTVWY' # 20 AAs
+AA_TO_INT = {aa: i for i, aa in enumerate(AA_CODES)}
+
+# Get the maximum length for padding
+MAX_LEN_PAD = ml_data['Sequence'].str.len().max()
+print(f"Max sequence length (for padding): {MAX_LEN_PAD}")
+
+
+def one_hot_encode_sequence(sequence, max_len):
+    # Pad the sequence with 'X' (or just cut if too long)
+    padded_seq = sequence.ljust(max_len, 'X')[:max_len]
+
+    # Initialize the encoding matrix: (Sequence Length) x (20 Amino Acids)
+    encoding = np.zeros((max_len, len(AA_CODES)))
+
+    for i, aa in enumerate(padded_seq):
+        if aa in AA_TO_INT:
+            # Set the corresponding amino acid index to 1
+            encoding[i, AA_TO_INT[aa]] = 1
+
+    return encoding
+
+# Apply the encoding function to the DataFrame column
+X = np.array([one_hot_encode_sequence(seq, MAX_LEN_PAD) for seq in ml_data['Sequence']])
+
+# 4. Split the data into Training and Testing sets
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=42, stratify=Y)
+
+print(f"Features (X) shape: {X.shape} (Num_Sequences, Max_Length, Num_AAs)")
+print(f"Training set size: {len(X_train)}")
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense
+
+# --- Model Definition ---
+input_shape = (X_train.shape[1], X_train.shape[2]) # (Max_Length, Num_AAs)
+num_classes = len(label_encoder.classes_)
+
+model = Sequential([
+    # 1D Convolutional Layer: Learns motifs of size 5 (kernel_size)
+    Conv1D(filters=32, kernel_size=5, activation='relu', input_shape=input_shape),
+    MaxPooling1D(pool_size=2),
+
+    # Second set of layers (optional, but improves learning complex patterns)
+    Conv1D(filters=64, kernel_size=5, activation='relu'),
+    MaxPooling1D(pool_size=2),
+
+    # Flatten the 3D output for the Dense classification layers
+    Flatten(),
+
+    # Fully Connected Layer
+    Dense(128, activation='relu'),
+
+    # Output Layer (softmax for multi-class, sigmoid for binary)
+    Dense(num_classes, activation='softmax' if num_classes > 2 else 'sigmoid')
+])
+
+# --- Model Compilation ---
+model.compile(optimizer='adam',
+              loss='sparse_categorical_crossentropy', # Use 'binary_crossentropy' for 2 classes
+              metrics=['accuracy'])
+
+# Display the model structure
+print("\n--- Model Architecture ---")
+model.summary()
+
+# --- Model Training ---
+print("\n--- Starting Training ---")
+history = model.fit(
+    X_train, Y_train,
+    epochs=10,
+    batch_size=32,
+    validation_data=(X_test, Y_test),
+    verbose=1
+)
